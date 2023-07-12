@@ -569,7 +569,7 @@ class BlipEncoder(nn.Module):
         super().__init__()
         self.config = config
         self.layers = nn.ModuleList([BlipEncoderLayer(config) for _ in range(config.num_hidden_layers)])
-        self.gradient_checkpointing = False
+        self.gradient_checkpointing = True
 
     def forward(
         self,
