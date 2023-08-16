@@ -438,7 +438,6 @@ class GenerationTesterMixin:
         input_ids,
         attention_mask,
         max_length,
-        num_return_sequences,
         beam_scorer,
         beam_kwargs,
         logits_warper,
@@ -463,7 +462,7 @@ class GenerationTesterMixin:
             **logits_warper_kwargs,
             **model_kwargs,
         )
-        # beam_search does not automatically interleave `batch_size` dim for `num_beams * num_return_sequences`
+        # beam_search does not automatically interleave `batch_size` dim for `num_beams`
         torch.manual_seed(0)
         kwargs = {}
         if model.config.is_encoder_decoder:
@@ -471,13 +470,13 @@ class GenerationTesterMixin:
                 model,
                 input_ids,
                 attention_mask,
-                num_interleave=beam_scorer.num_beams * num_return_sequences,
+                num_interleave=beam_scorer.num_beams,
                 output_attentions=output_attentions,
                 output_hidden_states=output_hidden_states,
             )
             kwargs["encoder_outputs"] = encoder_outputs
         elif attention_mask is not None:
-            attention_mask = attention_mask.repeat_interleave(beam_scorer.num_beams * num_return_sequences, dim=0)
+            attention_mask = attention_mask.repeat_interleave(beam_scorer.num_beams, dim=0)
 
         # prevent flaky generation test failures
         logits_processor = LogitsProcessorList()
@@ -486,7 +485,7 @@ class GenerationTesterMixin:
         with torch.no_grad():
             model_kwargs = {"attention_mask": attention_mask} if attention_mask is not None else {}
             output_beam_sample = model.beam_sample(
-                input_ids.repeat_interleave(beam_scorer.num_beams * num_return_sequences, dim=0),
+                input_ids.repeat_interleave(beam_scorer.num_beams, dim=0),
                 beam_scorer,
                 max_length=max_length,
                 logits_warper=logits_warper,
@@ -891,13 +890,9 @@ class GenerationTesterMixin:
 
             self.assertListEqual(output_generate.tolist(), output_beam_search.tolist())
 
-            # check `generate()` and `beam_search()` are equal for `num_return_sequences`
-            num_return_sequences = 2
             if model.config.is_encoder_decoder:
                 max_length = 4
-            beam_kwargs, beam_scorer = self._get_beam_scorer_and_kwargs(
-                input_ids.shape[0], max_length, num_return_sequences=num_return_sequences
-            )
+            beam_kwargs, beam_scorer = self._get_beam_scorer_and_kwargs(input_ids.shape[0], max_length)
 
             output_generate, output_beam_search = self._beam_search_generate(
                 model=model,
@@ -1036,21 +1031,15 @@ class GenerationTesterMixin:
             model = model_class(config).to(torch_device).eval()
 
             # check `generate()` and `beam_search()` are equal
-            # change `num_return_sequences = 2` but not for `beam_scorer`
-            num_return_sequences = 2
             if model.config.is_encoder_decoder:
                 max_length = 4
-            beam_kwargs, beam_scorer = self._get_beam_scorer_and_kwargs(
-                input_ids.shape[0] * num_return_sequences, max_length
-            )
-            beam_kwargs["num_return_sequences"] = num_return_sequences
+            beam_kwargs, beam_scorer = self._get_beam_scorer_and_kwargs(input_ids.shape[0], max_length)
 
             output_generate, output_beam_sample = self._beam_sample_generate(
                 model=model,
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 max_length=max_length,
-                num_return_sequences=num_return_sequences,
                 beam_scorer=beam_scorer,
                 beam_kwargs=beam_kwargs,
                 logits_warper=logits_warper,
@@ -1074,20 +1063,15 @@ class GenerationTesterMixin:
             model = model_class(config).to(torch_device).eval()
             logits_warper_kwargs, logits_warper = self._get_warper_and_kwargs(num_beams=1)
 
-            num_return_sequences = 2
             if model.config.is_encoder_decoder:
                 max_length = 4
-            beam_kwargs, beam_scorer = self._get_beam_scorer_and_kwargs(
-                input_ids.shape[0] * num_return_sequences, max_length
-            )
-            beam_kwargs["num_return_sequences"] = num_return_sequences
+            beam_kwargs, beam_scorer = self._get_beam_scorer_and_kwargs(input_ids.shape[0], max_length)
 
             output_beam_sample, output_generate = self._beam_sample_generate(
                 model=model,
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 max_length=max_length,
-                num_return_sequences=num_return_sequences,
                 beam_scorer=beam_scorer,
                 beam_kwargs=beam_kwargs,
                 logits_warper=logits_warper,
@@ -1113,9 +1097,7 @@ class GenerationTesterMixin:
             self.assertTrue((output_generate["sequences_scores"] < 0).all().item())
 
             for output in (output_beam_sample, output_generate):
-                self._check_outputs(
-                    output, input_ids, model.config, num_return_sequences=num_return_sequences * beam_scorer.num_beams
-                )
+                self._check_outputs(output, input_ids, model.config, num_return_sequences=beam_scorer.num_beams)
 
     def test_generate_without_input_ids(self):
         config, _, _, max_length = self._get_input_ids_and_config()
@@ -1456,6 +1438,49 @@ class GenerationTesterMixin:
 
             for output in (output_contrastive, output_generate):
                 self._check_outputs(output, input_ids, model.config, use_cache=True)
+
+    def test_contrastive_generate_low_memory(self):
+        # Check that choosing 'low_memory' does not change the model output
+        for model_class in self.all_generative_model_classes:
+            # won't fix: FSMT, Reformer, gptbigcode, and speech2text have a different cache variable type (and format).
+            if any(
+                model_name in model_class.__name__.lower()
+                for model_name in ["fsmt", "reformer", "gptbigcode", "speech2text"]
+            ):
+                return
+
+            config, input_ids, attention_mask, max_length = self._get_input_ids_and_config(batch_size=1)
+
+            # NOTE: contrastive search only works with cache on at the moment.
+            if not hasattr(config, "use_cache"):
+                return
+
+            config.use_cache = True
+            config.is_decoder = True
+
+            # test output equality of low versus high memory
+            model = model_class(config).to(torch_device).eval()
+
+            low_output = model.generate(
+                input_ids,
+                top_k=4,
+                penalty_alpha=0.6,
+                low_memory=True,
+                max_length=max_length,
+                attention_mask=attention_mask,
+            )
+
+            high_output = model.generate(
+                input_ids,
+                top_k=4,
+                penalty_alpha=0.6,
+                low_memory=False,
+                max_length=max_length,
+                attention_mask=attention_mask,
+            )
+            self.assertListEqual(low_output.tolist(), high_output.tolist())
+
+        return
 
     @slow  # TODO(Joao): remove this. Some models (e.g. data2vec, xcom, roberta) have an error rate between 1 and 10%.
     def test_assisted_decoding_matches_greedy_search(self):
@@ -2539,6 +2564,46 @@ class GenerationIntegrationTests(unittest.TestCase, GenerationIntegrationTestsMi
                 "The soldiers, who had been stationed at the base for more than a year before being evacuated"
                 " screaming scared",
                 "The child was taken to a local hospital where he died.\n 'I don't think screaming scared",
+            ],
+        )
+
+    @slow
+    def test_cfg_mixin(self):
+        model = GPT2LMHeadModel.from_pretrained("gpt2").to(torch_device)
+        tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
+
+        input = tokenizer(["The dragon flew over Paris,"], return_tensors="pt", return_attention_mask=True)
+        input["input_ids"] = input["input_ids"].to(torch_device)
+        input["attention_mask"] = input["attention_mask"].to(torch_device)
+
+        outputs = model.generate(**input, max_new_tokens=32, guidance_scale=1.5)
+        generated_text = tokenizer.batch_decode(outputs, skip_special_tokens=True)
+
+        self.assertListEqual(
+            generated_text,
+            [
+                "The dragon flew over Paris, landing in the Rue de la Bastille. The crowd was so excited "
+                'that they had to leave the city.\n\n"We\'re going to Paris!"\n'
+            ],
+        )
+
+        neg = tokenizer(["France,"], return_tensors="pt", return_attention_mask=True)
+        neg["input_ids"] = neg["input_ids"].to(torch_device)
+        neg["attention_mask"] = neg["attention_mask"].to(torch_device)
+        outputs = model.generate(
+            **input,
+            max_new_tokens=32,
+            guidance_scale=1.5,
+            negative_prompt_ids=neg["input_ids"],
+            negative_prompt_attention_mask=neg["attention_mask"],
+        )
+        generated_text = tokenizer.batch_decode(outputs, skip_special_tokens=True)
+
+        self.assertListEqual(
+            generated_text,
+            [
+                'The dragon flew over Paris, landing on the pavement.\n\n"Paris!"\n\n"Paris!"\n\n"'
+                'Paris!"\n\n"Paris!"\n\n"Paris!"\n\n'
             ],
         )
 

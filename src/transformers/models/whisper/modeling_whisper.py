@@ -80,7 +80,7 @@ def _make_causal_mask(
     Make causal mask used for bi-directional self-attention.
     """
     bsz, tgt_len = input_ids_shape
-    mask = torch.full((tgt_len, tgt_len), torch.tensor(torch.finfo(dtype).min, device=device), device=device)
+    mask = torch.full((tgt_len, tgt_len), torch.finfo(dtype).min, device=device)
     mask_cond = torch.arange(mask.size(-1), device=device)
     mask.masked_fill_(mask_cond < (mask_cond + 1).view(mask.size(-1), 1), 0)
     mask = mask.to(dtype)
@@ -1649,9 +1649,21 @@ class WhisperForConditionalGeneration(WhisperPreTrainedModel):
             generation_config.return_timestamps = False
 
         if language is not None:
+            if not hasattr(generation_config, "lang_to_id"):
+                raise ValueError(
+                    "The generation config is outdated and is thus not compatible with the `language` argument"
+                    "to `generate`. Either set the language using the `forced_decoder_ids` in the model config, "
+                    "or update the generation config as per the instructions https://github.com/huggingface/transformers/issues/25084#issuecomment-1664398224"
+                )
             language = language.lower()
             generation_config.language = language
         if task is not None:
+            if not hasattr(generation_config, "task_to_id"):
+                raise ValueError(
+                    "The generation config is outdated and is thus not compatible with the `task` argument"
+                    "to `generate`. Either set the task using the `forced_decoder_ids` in the model config, "
+                    "or update the generation config as per the instructions https://github.com/huggingface/transformers/issues/25084#issuecomment-1664398224"
+                )
             generation_config.task = task
 
         forced_decoder_ids = None
